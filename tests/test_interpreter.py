@@ -338,3 +338,56 @@ def test_reasoning_args_per_model_family():
     assert interpreter._reasoning_args("openai/gpt-oss-120b") == {"reasoning_effort": "low"}
     assert interpreter._reasoning_args("qwen/qwen3.8-27b") == {"reasoning_effort": "none"}
     assert interpreter._reasoning_args("some/other-model") == {}
+
+
+def _http_error(code, retry_after=None):
+    import email.message
+    import urllib.error
+
+    headers = email.message.Message()
+    if retry_after is not None:
+        headers["retry-after"] = str(retry_after)
+    return urllib.error.HTTPError("https://api.groq.com", code, "err", headers, None)
+
+
+def test_groq_rotates_models_and_waits_out_rate_limit_once(monkeypatch):
+    calls = []
+    sleeps = []
+    ok_body = {"choices": [{"message": {"content": wrap(entry(0, "no_charge_window", {"hours": [2]}))}}]}
+
+    def fake_post(url, payload, headers):
+        calls.append(payload["model"])
+        if len(calls) <= 2:  # both models rate-limited on the first pass
+            raise _http_error(429, retry_after=1)
+        return ok_body
+
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setenv("GROQ_MODELS", "m1,m2")
+    monkeypatch.setattr(interpreter, "_post_json", fake_post)
+    monkeypatch.setattr(interpreter.time, "sleep", sleeps.append)
+    out = interpreter.call_groq("sys", "user")
+    assert "no_charge_window" in out
+    assert calls == ["m1", "m2", "m1"]
+    assert sleeps and sleeps[0] <= interpreter.MAX_RATE_LIMIT_WAIT_S + 1
+
+
+def test_groq_does_not_wait_on_long_retry_after_or_non_429(monkeypatch):
+    sleeps = []
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setenv("GROQ_MODELS", "m1,m2")
+    monkeypatch.setattr(interpreter.time, "sleep", sleeps.append)
+
+    def long_wait(url, payload, headers):
+        raise _http_error(429, retry_after=60)
+
+    monkeypatch.setattr(interpreter, "_post_json", long_wait)
+    with pytest.raises(Exception):
+        interpreter.call_groq("sys", "user")
+
+    def server_error(url, payload, headers):
+        raise _http_error(503)
+
+    monkeypatch.setattr(interpreter, "_post_json", server_error)
+    with pytest.raises(Exception):
+        interpreter.call_groq("sys", "user")
+    assert sleeps == []

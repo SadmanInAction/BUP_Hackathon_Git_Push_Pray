@@ -21,7 +21,7 @@ Configuration (environment variables; no secrets are ever logged):
     GEMINI_MODEL            default "gemini-2.5-flash"
     OLLAMA_HOST             default "http://localhost:11434"
     OLLAMA_MODEL            default "qwen2.5:3b"
-    GRIDWISE_LLM_TIMEOUT    per-call timeout in seconds, default 8
+    GRIDWISE_LLM_TIMEOUT    per-call timeout in seconds, default 6
 """
 
 from __future__ import annotations
@@ -141,9 +141,9 @@ def build_user_prompt(operator_notes: list[str], battery: dict) -> str:
 
 def _timeout() -> float:
     try:
-        return float(os.environ.get("GRIDWISE_LLM_TIMEOUT", "8"))
+        return float(os.environ.get("GRIDWISE_LLM_TIMEOUT", "6"))
     except ValueError:
-        return 8.0
+        return 6.0
 
 
 def _post_json(url: str, payload: dict, headers: dict) -> dict:
@@ -166,6 +166,7 @@ def _messages(system: str, user: str) -> list[dict]:
     ]
 
 
+MAX_RATE_LIMIT_WAIT_S = 8.0
 DEFAULT_GROQ_MODELS = "qwen/qwen3.8-27b,openai/gpt-oss-120b,openai/gpt-oss-20b"
 
 
@@ -184,26 +185,37 @@ def call_groq(system: str, user: str) -> str:
         raise RuntimeError("GROQ_API_KEY not set")
     models = [m.strip() for m in os.environ.get("GROQ_MODELS", DEFAULT_GROQ_MODELS).split(",") if m.strip()]
     last_exc: Exception = RuntimeError("no GROQ_MODELS configured")
-    for model in models:
-        try:
-            data = _post_json(
-                "https://api.groq.com/openai/v1/chat/completions",
-                {
-                    "model": model,
-                    "messages": _messages(system, user),
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                    **_reasoning_args(model),
-                },
-                # Groq sits behind Cloudflare, which rejects urllib's default User-Agent.
-                {"Authorization": f"Bearer {key}", "User-Agent": "gridwise/1.0"},
-            )
-            return data["choices"][0]["message"]["content"]
-        except Exception as exc:
-            # Each model has its own free-tier quota: on rate limit / retired model /
-            # server error, move straight on to the next one.
-            log.warning("groq model %s failed (%s)", model, getattr(exc, "code", "") or type(exc).__name__)
-            last_exc = exc
+    for attempt in range(2):
+        retry_after = []
+        for model in models:
+            try:
+                data = _post_json(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    {
+                        "model": model,
+                        "messages": _messages(system, user),
+                        "temperature": 0,
+                        "response_format": {"type": "json_object"},
+                        **_reasoning_args(model),
+                    },
+                    # Groq sits behind Cloudflare, which rejects urllib's default User-Agent.
+                    {"Authorization": f"Bearer {key}", "User-Agent": "gridwise/1.0"},
+                )
+                return data["choices"][0]["message"]["content"]
+            except Exception as exc:
+                # Each model has its own free-tier quota: on rate limit / retired model /
+                # server error, move straight on to the next one.
+                code = getattr(exc, "code", "")
+                log.warning("groq model %s failed (%s)", model, code or type(exc).__name__)
+                last_exc = exc
+                if code == 429:
+                    headers = getattr(exc, "headers", None)
+                    retry_after.append(_to_number(headers.get("retry-after") if headers else None) or 2.0)
+        # Every model rate-limited: wait out the shortest Retry-After once, if it is short.
+        if attempt == 0 and retry_after and min(retry_after) <= MAX_RATE_LIMIT_WAIT_S:
+            time.sleep(min(retry_after) + 0.2)
+        else:
+            break
     raise last_exc
 
 
