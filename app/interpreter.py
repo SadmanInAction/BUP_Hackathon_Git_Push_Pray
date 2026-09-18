@@ -8,6 +8,7 @@ still passes through app/guardrails.py before it reaches the optimizer.
 import json
 import logging
 import os
+import time
 
 import httpx
 
@@ -20,9 +21,14 @@ except ImportError:
 log = logging.getLogger("gridwise.interpreter")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-PRIMARY_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
-HTTP_TIMEOUT_S = 9.0
+# Tried in order. Each Groq model has its own free-tier rate limit, so on a 429 or
+# error the next model is tried immediately.
+MODELS = [m.strip() for m in os.getenv(
+    "GROQ_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b").split(",") if m.strip()]
+HTTP_TIMEOUT_S = 6.0
+MAX_RATE_LIMIT_WAIT_S = 8.0
+_CACHE: dict[tuple, list] = {}
+_CACHE_MAX = 512
 
 SYSTEM_PROMPT = """You convert campus energy operator notes into structured directives for a 24-hour schedule (hours 0-23).
 
@@ -39,6 +45,7 @@ Time rules:
 - A window "from A until B" / "between A and B" / "A-B" gives start_hour=A and end_hour=B; the END IS EXCLUSIVE. "1 PM to 3 PM" -> start 13, end 15 (hours 13,14).
 - "until midnight" / "until end of day" -> end_hour=24. "all day" -> start 0, end 24.
 - A single hour ("at 5 PM", "during the 5 PM hour") -> start 17, end 18.
+- If AM/PM is not stated, pick the reading that makes physical sense. Solar exists only in daylight (about 6-18), so for solar notes "one until three" means 13-15 and "from 11 to 2" means 11-14. "Evening"/"tonight" means PM; "morning" means AM.
 - Use several windows only if the note names several separate periods.
 
 Value rules:
@@ -137,18 +144,19 @@ def _normalise(item: dict, i: int, battery: dict) -> dict:
 
 
 def _call_llm(model: str, user_prompt: str, api_key: str) -> list:
-    resp = httpx.post(
-        GROQ_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": model,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                         {"role": "user", "content": user_prompt}],
-        },
-        timeout=HTTP_TIMEOUT_S,
-    )
+    body = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                     {"role": "user", "content": user_prompt}],
+    }
+    if "gpt-oss" in model:
+        body["reasoning_effort"] = "low"  # keeps latency ~1 s
+    elif "qwen3" in model:
+        body["reasoning_effort"] = "none"
+    resp = httpx.post(GROQ_URL, headers={"Authorization": f"Bearer {api_key}"},
+                      json=body, timeout=HTTP_TIMEOUT_S)
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
     data = json.loads(content)
@@ -156,6 +164,27 @@ def _call_llm(model: str, user_prompt: str, api_key: str) -> list:
     if not isinstance(items, list):
         raise ValueError("model output missing 'interpretations' list")
     return items
+
+
+def _call_with_fallback(user_prompt: str, api_key: str) -> list | None:
+    """Try each model; if all are rate-limited, wait out the shortest Retry-After once."""
+    for attempt in range(2):
+        retry_after = []
+        for model in MODELS:
+            try:
+                return _call_llm(model, user_prompt, api_key)
+            except Exception as exc:  # never log the exception text: it could echo headers
+                resp = getattr(exc, "response", None)
+                status = getattr(resp, "status_code", "-")
+                log.warning("LLM call failed model=%s error=%s status=%s",
+                            model, type(exc).__name__, status)
+                if status == 429:
+                    retry_after.append(_num(resp.headers.get("retry-after")) or 2.0)
+        if attempt == 0 and retry_after and min(retry_after) <= MAX_RATE_LIMIT_WAIT_S:
+            time.sleep(min(retry_after) + 0.2)
+        else:
+            break
+    return None
 
 
 def interpret_notes(operator_notes: list[str], hours: list[dict],
@@ -175,15 +204,15 @@ def interpret_notes(operator_notes: list[str], hours: list[dict],
     user_prompt = (f"Battery capacity_kwh = {battery['capacity_kwh']}.\n"
                    f"There are {n} operator notes:\n{notes_text}")
 
-    items = None
-    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
-        try:
-            items = _call_llm(model, user_prompt, api_key)
-            break
-        except Exception as exc:  # never log the exception text: it could echo headers
-            log.warning("LLM call failed model=%s error=%s", model, type(exc).__name__)
+    cache_key = (tuple(operator_notes), float(battery["capacity_kwh"]))
+    items = _CACHE.get(cache_key)
     if items is None:
-        return [_no_op(i, "LLM unavailable; note treated as no_op.") for i in range(n)]
+        items = _call_with_fallback(user_prompt, api_key)
+        if items is None:
+            return [_no_op(i, "LLM unavailable; note treated as no_op.") for i in range(n)]
+        if len(_CACHE) >= _CACHE_MAX:
+            _CACHE.clear()
+        _CACHE[cache_key] = items
 
     by_index: dict[int, dict] = {}
     for pos, item in enumerate(items):
