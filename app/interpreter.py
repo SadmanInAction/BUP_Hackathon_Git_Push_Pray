@@ -37,6 +37,12 @@ import time
 import urllib.request
 from typing import Any, Callable, Optional
 
+try:  # local development convenience; in Docker/hosting, env vars are injected directly
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 log = logging.getLogger("gridwise.interpreter")
 
 ALLOWED_TYPES = (
@@ -74,7 +80,8 @@ SYSTEM_PROMPT = """Convert campus energy operator notes into directives for toda
 - no_discharge_window: battery may not discharge. {start_hour,end_hour,hours}
 - max_grid_window: grid import capped per hour. {start_hour,end_hour,hours,max_grid_kwh}
 - no_op: does not affect today's solar, battery or grid (events, admin news, future dates). structured_adjustment null, applies false.
-Times: start_hour/end_hour are the stated boundaries (noon 12, 1 PM 13, midnight 0). Start INCLUDED, end EXCLUDED: "1 PM to 3 PM" -> hours [13,14].
+Times: start_hour/end_hour are the stated boundaries (noon 12, 1 PM 13, midnight 0; "until midnight" -> end 24). Start INCLUDED, end EXCLUDED: "1 PM to 3 PM" -> hours [13,14].
+If AM/PM is not stated, pick the physically sensible reading: solar exists only in daylight (about 6-18), so for solar "one until three" is 13-15; "evening"/"tonight" is PM, "morning" is AM.
 applies is true for every type except no_op. Never invent values or types.
 Reply with ONLY JSON: {"interpretations":[{"note_index","applies","directive_type","structured_adjustment","explanation"}]}, one entry per note, in order, explanation under 15 words."""
 
@@ -162,6 +169,15 @@ def _messages(system: str, user: str) -> list[dict]:
 DEFAULT_GROQ_MODELS = "qwen/qwen3.8-27b,openai/gpt-oss-120b,openai/gpt-oss-20b"
 
 
+def _reasoning_args(model: str) -> dict:
+    # Reasoning tokens cost latency and free-tier quota; this task doesn't need them.
+    if "gpt-oss" in model:
+        return {"reasoning_effort": "low"}
+    if "qwen3" in model:
+        return {"reasoning_effort": "none"}
+    return {}
+
+
 def call_groq(system: str, user: str) -> str:
     key = os.environ.get("GROQ_API_KEY")
     if not key:
@@ -177,6 +193,7 @@ def call_groq(system: str, user: str) -> str:
                     "messages": _messages(system, user),
                     "temperature": 0,
                     "response_format": {"type": "json_object"},
+                    **_reasoning_args(model),
                 },
                 # Groq sits behind Cloudflare, which rejects urllib's default User-Agent.
                 {"Authorization": f"Bearer {key}", "User-Agent": "gridwise/1.0"},

@@ -131,12 +131,15 @@ PARAPHRASES = [
     # solar_reduction
     ("PV production will drop to about 20% between 13:00 and 15:00.", S, [13, 14], 0.2),
     ("Panel washing from one until three in the afternoon will leave roughly one-fifth of normal solar output.", S, [13, 14], 0.2),
+    ("Panel washing from one until three will leave roughly one-fifth of normal solar output.", S, [13, 14], 0.2),
+    ("Expect an 80% reduction in rooftop solar during the 1-3 PM maintenance window.", S, [13, 14], 0.2),
     ("Heavy haze is expected to cut rooftop generation by three quarters from 9 AM to 11 AM.", S, [9, 10], 0.25),
     ("A crane will fully shade the solar array from 15:00 to 17:00, so assume no PV at all.", S, [15, 16], 0.0),
     ("Only 40 percent of the predicted solar yield will be usable from 10 in the morning until 1 in the afternoon.", S, [10, 11, 12], 0.4),
     # minimum_battery_reserve
     ("Hold a minimum of 75 kWh of stored energy from 20:00 to 23:00 as backup for the labs.", R, [20, 21, 22], 75),
     ("Between 4 PM and 7 PM the battery must not fall below a quarter of its capacity.", R, [16, 17, 18], 50),
+    ("Keep 60 kWh in the battery tonight from 7 until 10.", R, [19, 20, 21], 60),
     ("The medical centre needs 120 kilowatt-hours kept in storage from 5 o'clock in the evening until 8 PM.", R, [17, 18, 19], 120),
     # no_charge_window
     ("The battery can't accept any charge from 03:00 to 06:00 while the BMS firmware is updated.", NC, [3, 4, 5], None),
@@ -173,7 +176,8 @@ def test_paraphrases(note, dtype, hours, value):
 @live
 @pytest.mark.live
 def test_mixed_batch_keeps_order():
-    notes = [PARAPHRASES[15][0], PARAPHRASES[12][0], PARAPHRASES[2][0]]
+    first_of = {dtype: note for note, dtype, _, _ in reversed(PARAPHRASES)}
+    notes = [first_of[NOP], first_of[G], first_of[S]]
     got = interpret_notes(notes, HOURS, BATTERY)
     assert_shape(got, 3)
     assert [e["directive_type"] for e in got] == [NOP, G, S]
@@ -328,3 +332,9 @@ def test_prompt_contains_capacity_and_every_note():
     interpret_notes(["first\nnote", "second"], HOURS, {"capacity_kwh": 260}, llm=spy)
     assert "capacity_kwh: 260" in seen["user"]
     assert "[0] first note" in seen["user"] and "[1] second" in seen["user"]
+
+
+def test_reasoning_args_per_model_family():
+    assert interpreter._reasoning_args("openai/gpt-oss-120b") == {"reasoning_effort": "low"}
+    assert interpreter._reasoning_args("qwen/qwen3.8-27b") == {"reasoning_effort": "none"}
+    assert interpreter._reasoning_args("some/other-model") == {}
