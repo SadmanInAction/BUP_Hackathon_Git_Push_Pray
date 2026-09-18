@@ -11,7 +11,7 @@ deterministic guardrails, and returns a minimum-cost valid 24-hour battery/grid 
 | Health endpoint | `GET /health` → `{"status":"ok"}` |
 | Main endpoint | `POST /optimize-energy` |
 | Port | `8000` (override with env `PORT`) |
-| Public URL | _TBD – filled in at submission_ |
+| Public URL | https://gridwise-e43e.onrender.com (Render, Singapore) |
 | Docker image | `docker.io/dockersakib/gridwise:v1.0.0` (digest `sha256:6b3982acf5bb7a51030c51b4d890caf1d2d0868165a7a789f88616b808e6d707`) |
 
 ## Architecture
@@ -101,6 +101,8 @@ curl -s -X POST http://localhost:8000/optimize-energy \
   --data @tests/sample_request.json
 ```
 
+Against the live deployment, replace `http://localhost:8000` with `https://gridwise-e43e.onrender.com`.
+
 `tests/sample_request.json` is the input of public sample `SAMPLE-01`. Response shape:
 
 ```json
@@ -163,7 +165,7 @@ Run the tests inside the container with `docker run --rm gridwise python -m pyte
 - [PuLP](https://coin-or.github.io/pulp/) with the bundled [COIN-OR CBC](https://github.com/coin-or/Cbc) solver: MILP optimization
 - pytest, httpx: tests
 - Groq API (called with `httpx`), python-dotenv
-- Public URL during development: Cloudflare quick tunnel (`cloudflared tunnel --url http://localhost:8000`)
+- Hosting: [Render](https://render.com) free web service (runs the Docker Hub image)
 - AI coding assistant (Claude Code) used during development, as permitted by the rulebook.
 
 ## Known limitations
@@ -172,7 +174,8 @@ Run the tests inside the container with `docker run --rm gridwise python -m pyte
   out, notes fall back to `no_op`: the service stays up, but those directives are not applied.
 - Directives that are infeasible together are relaxed with a penalty rather than rejected.
 - Output values are rounded to 4 decimals (the judge tolerance is 0.01).
-- A Cloudflare quick-tunnel URL changes each time the tunnel restarts.
+- Hosted on the Render free tier, which sleeps after 15 min idle; an external pinger hits /health every 5 min to keep it warm. A cold start takes about 1 min.
+- Groq free tier: about 1,000 requests per day per model; the three-model chain and caching spread the load.
 
 ## Secret handling
 
