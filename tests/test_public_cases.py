@@ -8,6 +8,7 @@ Run:  python -m pytest -v tests/test_public_cases.py
   interpretation/application tests are skipped while app/interpreter.py is the stub.
 """
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,7 @@ from app.optimizer import optimize_schedule
 TOL = 0.01
 CASES = json.loads((Path(__file__).parent / "sample_cases.json").read_text(encoding="utf-8"))["cases"]
 IDS = [c["id"] for c in CASES]
-USING_STUB = getattr(interpreter, "IS_STUB", False)
+USING_STUB = getattr(interpreter, "IS_STUB", False) or not os.getenv("GROQ_API_KEY")
 
 client = TestClient(main.app)
 
@@ -130,7 +131,7 @@ def test_api_schema_and_self_consistency(case):
     replay_and_check(inp, di, out)
 
 
-@pytest.mark.skipif(USING_STUB, reason="interpreter stub in place")
+@pytest.mark.skipif(USING_STUB, reason="LLM not configured (GROQ_API_KEY unset)")
 @pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_api_ground_truth_interpretation(case):
     out = client.post("/optimize-energy", json=case["input"]).json()
@@ -148,7 +149,7 @@ def test_api_ground_truth_interpretation(case):
                 assert abs(got["structured_adjustment"][k] - v) <= TOL, (k, got)
 
 
-@pytest.mark.skipif(USING_STUB, reason="interpreter stub in place")
+@pytest.mark.skipif(USING_STUB, reason="LLM not configured (GROQ_API_KEY unset)")
 @pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_api_ground_truth_application_and_cost(case):
     exp = case["expected_output"]

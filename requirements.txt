@@ -2,6 +2,7 @@ fastapi==0.141.1
 uvicorn[standard]==0.53.0
 pydantic==2.13.5
 PuLP==3.3.2
+httpx==0.28.1
+python-dotenv==1.1.1
 # test-only
 pytest==9.1.1
-httpx==0.28.1
