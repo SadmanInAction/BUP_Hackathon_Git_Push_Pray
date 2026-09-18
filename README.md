@@ -26,7 +26,7 @@ operator_notes ──► LLM interpreter ──► guardrails ──► MILP opt
    Structural errors → HTTP 400 (field locations only, never echoed values or stack traces).
 2. **LLM interpretation** (`app/interpreter.py`): one entry per note —
    `solar_reduction`, `minimum_battery_reserve`, `no_charge_window`, `no_discharge_window`,
-   `max_grid_window`, or `no_op`. Model/provider: Groq `openai/gpt-oss-120b` (see below).
+   `max_grid_window`, or `no_op`. Model/provider: Groq `qwen/qwen3.8-27b` with fallbacks (see below).
    Called with a 22 s timeout; timeouts and provider errors degrade to `no_op` instead of failing.
 3. **Guardrails** (`app/guardrails.py`): LLM output is untrusted. Exactly one entry per note in
    `note_index` order; only supported types; hours unique ints 0–23, ascending; `factor ∈ [0,1]`;
@@ -72,21 +72,29 @@ PuLP ships the CBC solver binary, so no separate solver install is needed.
 |---|---|---|
 | `PORT` | no (default `8000`) | Port the server binds to (Docker image) |
 | `GROQ_API_KEY` | yes | Groq API key (free at https://console.groq.com, no card) |
-| `GROQ_MODELS` | no | Comma-separated model fallback chain (default `openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b`) |
+| `GROQ_MODELS` | no | Comma-separated model fallback chain (default `qwen/qwen3.8-27b,openai/gpt-oss-120b,openai/gpt-oss-20b`) |
+| `GEMINI_API_KEY` | no | Optional extra fallback provider (free key at https://aistudio.google.com), used only if every Groq model fails |
+| `GRIDWISE_LLM_PROVIDER` | no | Provider order, default `groq,gemini` (`ollama` is also supported for local experiments, but CPU inference is too slow for the 30 s judge limit) |
 
 Never commit `.env`; it is in `.gitignore` and `.dockerignore`.
 
 ## Model / provider
 
 - **Provider:** [Groq](https://groq.com) (OpenAI-compatible chat completions API).
-- **Primary model:** `openai/gpt-oss-120b` (`reasoning_effort=low`), falling back to `openai/gpt-oss-20b` and then `qwen/qwen3.8-27b`.
+- **Primary model:** `qwen/qwen3.8-27b` (`reasoning_effort=none`), falling back to `openai/gpt-oss-120b` and then `openai/gpt-oss-20b` (`reasoning_effort=low`).
   Each Groq model has its own free-tier rate limit, so on a 429 or error the next model is tried at once.
   If all three are rate-limited, the service waits once for the shortest Retry-After (8 s maximum).
-- **Why:** free, no card needed, about 1 s latency (p95 well under the 5 s target), and it answered all public samples and our paraphrase tests correctly.
-- **LLM role:** interprets every operator note in a single call (JSON mode, temperature 0).
-  The model returns the directive type, time windows as `start_hour`/`end_hour` (end exclusive), and the raw values:
-  remaining solar fraction, reserve in kWh or % of capacity, and the grid cap.
-  Deterministic code expands the windows into `hours` and converts % of capacity to kWh. The result then passes the guardrails.
+- **Why:** free, no card needed, median latency about 0.4 s (p95 about 1 s, well under the 5 s target).
+  Each of the three models, alone, answered all public samples and all 55 paraphrase / held-out notes in our tests correctly.
+- **LLM role:** interprets every operator note in a single call (JSON mode, temperature 0, few-shot prompt).
+  The model returns the full directive entry (type, `hours`, `factor` / `minimum_energy_kwh` / `max_grid_kwh`,
+  explanation), plus the window boundaries `start_hour`/`end_hour` exactly as stated in the note.
+- **Interpreter guardrails** (`app/interpreter.py`, before `app/guardrails.py` runs again in `main.py`):
+  `hours` are rebuilt from `start_hour`/`end_hour` (end exclusive, wrapping past midnight), which removes
+  the most common model error (end-inclusive windows); unsupported types, non-numeric or out-of-range values,
+  and missing/duplicate/out-of-range `note_index` values become `no_op` entries flagged with `[guardrail]`;
+  a percentage `factor` such as `25` is normalised to `0.25`; `applies` is always derived from the type.
+  Unparseable output is retried once. `interpret_notes` never raises.
 - **Caching:** identical note sets reuse the previous interpretation.
 - **Failure mode:** if the provider fails or times out, notes become `no_op`; the service still returns a valid schedule and never crashes.
 
@@ -134,7 +142,12 @@ python -m pytest -v
 ```
 
 `tests/test_paraphrases.py` checks 15 paraphrased notes (including the Problem Statement's own examples).
-The LLM-dependent tests are skipped when `GROQ_API_KEY` is unset.
+`tests/test_interpreter.py` checks the interpreter on its own: all 10 public samples, 20 more paraphrases of
+every directive type (number words, 24 h / AM-PM / no-AM-PM times, % of capacity, tricky distractors), and
+43 offline tests that feed deliberately malformed model output (invalid JSON, `NaN`, invented types,
+hour 25, duplicate indices, provider exceptions, rate limits) and check it always fails safe.
+The LLM-dependent tests are skipped when no provider key is set (`python -m pytest -m "not live"` runs only the offline ones;
+set `LIVE_TEST_DELAY=2` to pace live tests under the free-tier rate limit).
 
 `tests/test_public_cases.py` runs all 10 cases in `tests/sample_cases.json`. For each case it
 replays the plan the way the judge does: 24 unique hours; energy balance, effective solar,
@@ -164,7 +177,7 @@ Run the tests inside the container with `docker run --rm gridwise python -m pyte
 - [Pydantic](https://docs.pydantic.dev/): request validation
 - [PuLP](https://coin-or.github.io/pulp/) with the bundled [COIN-OR CBC](https://github.com/coin-or/Cbc) solver: MILP optimization
 - pytest, httpx: tests
-- Groq API (called with `httpx`), python-dotenv
+- Groq API (called with Python's standard `urllib`), optional Google Gemini API, python-dotenv
 - Hosting: [Render](https://render.com) free web service (runs the Docker Hub image)
 - AI coding assistant (Claude Code) used during development, as permitted by the rulebook.
 
