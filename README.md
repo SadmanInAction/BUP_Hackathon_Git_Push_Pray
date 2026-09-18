@@ -12,7 +12,7 @@ deterministic guardrails, and returns a minimum-cost valid 24-hour battery/grid 
 | Main endpoint | `POST /optimize-energy` |
 | Port | `8000` (override with env `PORT`) |
 | Public URL | _TBD – filled in at submission_ |
-| Docker image | _TBD – `docker.io/<user>/gridwise:<tag>`_ |
+| Docker image | `docker.io/dockersakib/gridwise:v1.0.0` (digest `sha256:6b3982acf5bb7a51030c51b4d890caf1d2d0868165a7a789f88616b808e6d707`) |
 
 ## Architecture
 
@@ -26,7 +26,7 @@ operator_notes ──► LLM interpreter ──► guardrails ──► MILP opt
    Structural errors → HTTP 400 (field locations only, never echoed values or stack traces).
 2. **LLM interpretation** (`app/interpreter.py`): one entry per note —
    `solar_reduction`, `minimum_battery_reserve`, `no_charge_window`, `no_discharge_window`,
-   `max_grid_window`, or `no_op`. Model/provider: _TBD (see below)_.
+   `max_grid_window`, or `no_op`. Model/provider: Groq `openai/gpt-oss-120b` (see below).
    Called with a 22 s timeout; timeouts and provider errors degrade to `no_op` instead of failing.
 3. **Guardrails** (`app/guardrails.py`): LLM output is untrusted. Exactly one entry per note in
    `note_index` order; only supported types; hours unique ints 0–23, ascending; `factor ∈ [0,1]`;
@@ -60,7 +60,7 @@ cd BUP_Hackathon_Git_Push_Pray
 python -m venv .venv
 # Windows: .venv\Scripts\activate      macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # then fill in the LLM key (see Environment variables)
+cp .env.example .env        # then set GROQ_API_KEY (see Environment variables)
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -71,13 +71,24 @@ PuLP ships the CBC solver binary, so no separate solver install is needed.
 | Name | Required | Purpose |
 |---|---|---|
 | `PORT` | no (default `8000`) | Port the server binds to (Docker image) |
-| _LLM key name TBD_ | yes | Credential for the LLM provider used by the interpreter |
+| `GROQ_API_KEY` | yes | Groq API key (free at https://console.groq.com, no card) |
+| `GROQ_MODELS` | no | Comma-separated model fallback chain (default `openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b`) |
 
 Never commit `.env`; it is in `.gitignore` and `.dockerignore`.
 
 ## Model / provider
 
-_TBD — Person A to fill in: provider, exact model ID, why it was chosen, prompt/output format._
+- **Provider:** [Groq](https://groq.com) (OpenAI-compatible chat completions API).
+- **Primary model:** `openai/gpt-oss-120b` (`reasoning_effort=low`), falling back to `openai/gpt-oss-20b` and then `qwen/qwen3.8-27b`.
+  Each Groq model has its own free-tier rate limit, so on a 429 or error the next model is tried at once.
+  If all three are rate-limited, the service waits once for the shortest Retry-After (8 s maximum).
+- **Why:** free, no card needed, about 1 s latency (p95 well under the 5 s target), and it answered all public samples and our paraphrase tests correctly.
+- **LLM role:** interprets every operator note in a single call (JSON mode, temperature 0).
+  The model returns the directive type, time windows as `start_hour`/`end_hour` (end exclusive), and the raw values:
+  remaining solar fraction, reserve in kWh or % of capacity, and the grid cap.
+  Deterministic code expands the windows into `hours` and converts % of capacity to kWh. The result then passes the guardrails.
+- **Caching:** identical note sets reuse the previous interpretation.
+- **Failure mode:** if the provider fails or times out, notes become `no_op`; the service still returns a valid schedule and never crashes.
 
 ## API examples
 
@@ -120,6 +131,9 @@ Status codes: `200` success · `400` malformed JSON or structurally invalid requ
 python -m pytest -v
 ```
 
+`tests/test_paraphrases.py` checks 15 paraphrased notes (including the Problem Statement's own examples).
+The LLM-dependent tests are skipped when `GROQ_API_KEY` is unset.
+
 `tests/test_public_cases.py` runs all 10 cases in `tests/sample_cases.json`. For each case it
 replays the plan the way the judge does: 24 unique hours; energy balance, effective solar,
 battery bounds, rate limits, transitions and directive windows checked every hour; end-of-day
@@ -131,13 +145,15 @@ Expected result: all tests pass.
 ## Docker fallback
 
 ```bash
-docker pull docker.io/<user>/gridwise:<tag>          # TBD at submission
-docker run --rm -p 8000:8000 --env-file .env docker.io/<user>/gridwise:<tag>
+docker pull docker.io/dockersakib/gridwise:v1.0.0
+docker run --rm -p 8000:8000 -e GROQ_API_KEY=<your-groq-key> docker.io/dockersakib/gridwise:v1.0.0
 curl -s http://localhost:8000/health
+curl -s -X POST http://localhost:8000/optimize-energy -H "Content-Type: application/json" --data @tests/sample_request.json
 ```
 
 The image binds `0.0.0.0:8000`, runs as a non-root user, and contains no secrets. Credentials are
-passed only at runtime (`--env-file` / `-e`). Build locally with `docker build -t gridwise .`.
+passed only at runtime (`-e` / `--env-file`). Pin by digest if preferred:
+`docker.io/dockersakib/gridwise@sha256:6b3982acf5bb7a51030c51b4d890caf1d2d0868165a7a789f88616b808e6d707`. Build locally with `docker build -t gridwise .`.
 Run the tests inside the container with `docker run --rm gridwise python -m pytest -q`.
 
 ## Dependencies / credits
@@ -146,7 +162,7 @@ Run the tests inside the container with `docker run --rm gridwise python -m pyte
 - [Pydantic](https://docs.pydantic.dev/): request validation
 - [PuLP](https://coin-or.github.io/pulp/) with the bundled [COIN-OR CBC](https://github.com/coin-or/Cbc) solver: MILP optimization
 - pytest, httpx: tests
-- LLM provider SDK: _TBD_
+- Groq API (called with `httpx`), python-dotenv
 - Public URL during development: Cloudflare quick tunnel (`cloudflared tunnel --url http://localhost:8000`)
 - AI coding assistant (Claude Code) used during development, as permitted by the rulebook.
 
